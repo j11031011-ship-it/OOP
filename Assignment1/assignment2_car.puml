@@ -1,0 +1,69 @@
+@startuml 题目2-三视角汽车类图
+skinparam classAttributeIconSize 0
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam class {
+  BackgroundColor #FDFDFD
+  BorderColor #333333
+  ArrowColor #333333
+}
+
+class CarFromManufacturer <<产品>> {
+  - vin: String
+  - model: String
+  - trim: String
+  - color: String
+  - productionDate: Date
+  - batchNo: String
+  - qualityResult: bool
+  __
+  + inspect(): bool
+  + recall(batchNo: String): void
+  + traceBatch(vin: String): String
+}
+
+class CarFromOwner <<交通工具>> {
+  - plateNo: String
+  - mileage: double
+  - fuelLevel: double
+  - maintenanceRecords: List<Record>
+  - insuranceExpireDate: Date
+  __
+  + start(): void
+  + drive(distance: double): void
+  + refuelOrCharge(amount: double): void
+  + maintain(): void
+  + renewInsurance(date: Date): void
+}
+
+class CarFromAuthority <<监管对象>> {
+  - plateNo: String
+  - vin: String
+  - ownerName: String
+  - vehicleType: String
+  - inspectionStatus: InspectionStatus
+  - violations: List<Violation>
+  __
+  + register(owner: String): void
+  + annualInspection(): bool
+  + recordViolation(v: Violation): void
+  + revokePlate(): void
+}
+
+enum InspectionStatus {
+  PASSED
+  EXPIRED
+  FAILED
+}
+
+CarFromAuthority ..> InspectionStatus : 使用 >
+
+note as N1
+  设计思想：视角决定抽象边界
+  厂家视角 = 产品（生产与质量追溯）
+  车主视角 = 交通工具（使用与保养）
+  交管视角 = 监管对象（合规与登记）
+  三者属性几乎不重叠，现实中经 VIN/车牌号
+  指向同一辆车，但建模上相互独立
+end note
+@enduml

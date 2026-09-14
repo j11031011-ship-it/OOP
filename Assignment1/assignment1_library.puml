@@ -1,0 +1,69 @@
+@startuml 题目1-图书馆借还书类图
+skinparam classAttributeIconSize 0
+skinparam defaultFontName "Microsoft YaHei"
+skinparam shadowing false
+skinparam class {
+  BackgroundColor #FDFDFD
+  BorderColor #333333
+  ArrowColor #333333
+}
+
+class Student {
+  - studentId: String
+  - name: String
+  - major: String
+  - grade: int
+  - borrowedBooks: List<Book>
+  - maxBorrowCount: int = 5
+  - fine: double
+  __
+  + canBorrow(): bool
+  + borrowBook(book: Book): bool
+  + returnBook(book: Book): bool
+  + queryBorrowed(): List<Book>
+  + payFine(amount: double): void
+}
+
+class Book {
+  - isbn: String
+  - title: String
+  - author: String
+  - publisher: String
+  - status: BookStatus
+  - dueDate: Date
+  - callNumber: String
+  __
+  + getStatus(): BookStatus
+  + markBorrowed(dueDate: Date): void
+  + markReturned(): void
+  + getDueDate(): Date
+}
+
+enum BookStatus {
+  IN_LIBRARY
+  BORROWED
+  RESERVED
+}
+
+class Librarian {
+  - staffId: String
+  - name: String
+  - department: String
+  __
+  + handleBorrow(student: Student, book: Book): bool
+  + handleReturn(student: Student, book: Book): double
+  + addNewBook(book: Book): void
+  + removeBook(book: Book): void
+  + remindOverdue(): void
+}
+
+Student "1" -- "0..*" Book : 借阅 >
+Librarian ..> Student : 借还资格审核 >
+Librarian ..> Book : 借还/出入库操作 >
+Book ..> BookStatus : 状态 >
+
+note right of Librarian
+  封装：书籍状态与学生借阅列表
+  只能由管理员(系统)方法修改
+end note
+@enduml
