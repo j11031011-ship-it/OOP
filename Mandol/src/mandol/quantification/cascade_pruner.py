@@ -199,6 +199,7 @@ class CascadeConfidencePruner:
         tower_min_ratio: Optional[Dict[TowerSource, float]] = None,
         absolute_min_score: float = 0.0,
         adaptive_dataset: Optional[str] = None,
+        use_raw_score: bool = False,
     ):
         if not 0.0 <= lambda_mmr <= 1.0:
             raise ValueError(f"lambda_mmr must be in [0, 1], got {lambda_mmr}")
@@ -236,6 +237,7 @@ class CascadeConfidencePruner:
         self.tower_min_ratio = tower_min_ratio
         self.absolute_min_score = absolute_min_score
         self.adaptive_dataset = adaptive_dataset
+        self.use_raw_score = use_raw_score
 
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -255,6 +257,7 @@ class CascadeConfidencePruner:
             f"stage3_mmr={'ON' if enable_stage3_mmr else 'OFF'}, "
             f"cap_to_input={'ON' if cap_to_input_tokens else 'OFF'}, "
             f"absolute_min_score={absolute_min_score}, "
+            f"stage1_score={'raw_per_tower' if use_raw_score else 'ce_score_global'}, "
             f"{_tmr_str}"
         )
 
@@ -416,6 +419,9 @@ class CascadeConfidencePruner:
                 for c in candidates
             ]
 
+        if self.use_raw_score:
+            return self._stage1_filter_per_tower(candidates)
+
         scores = [c.ce_score for c in candidates]
         med_s = statistics.median(scores)
         mad_s = statistics.median([abs(s - med_s) for s in scores])
@@ -459,7 +465,80 @@ class CascadeConfidencePruner:
         )
         return valid
 
-    
+    @staticmethod
+    def _raw_score(chunk: EnhancedCandidateChunk) -> float:
+        """Return the tower-native score when present, else the fused score."""
+        metadata = getattr(chunk, "raw_metadata", None) or {}
+        value = metadata.get("original_score") if isinstance(metadata, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return float(chunk.ce_score)
+
+    def _stage1_filter_per_tower(
+        self, candidates: List[EnhancedCandidateChunk]
+    ) -> List[Tuple[PrunedChunk, EnhancedCandidateChunk]]:
+        """Apply the MAD cutoff per tower on each tower's native score scale.
+
+        Stage 4 normalizes scores within the merged pool, so a global cutoff
+        compares quantities that are not commensurable (RRF ranks against
+        reranker probabilities). Grouping by tower restores a comparable unit
+        inside each group; the funnel order is preserved on the way out.
+        """
+        groups: Dict[str, List[EnhancedCandidateChunk]] = defaultdict(list)
+        for candidate in candidates:
+            tower_name = (
+                candidate.tower_source.value
+                if isinstance(candidate, EnhancedCandidateChunk)
+                else "UNKNOWN"
+            )
+            groups[tower_name].append(candidate)
+
+        kept_ids: set = set()
+        boundaries: Dict[str, float] = {}
+        epsilon = 1e-6
+        for tower_name, group in groups.items():
+            if len(group) < 2:
+                kept_ids.update(id(item) for item in group)
+                continue
+            raw_scores = [self._raw_score(item) for item in group]
+            med_s = statistics.median(raw_scores)
+            mad_s = statistics.median([abs(score - med_s) for score in raw_scores])
+            if mad_s < epsilon:
+                kept_ids.update(id(item) for item in group)
+                continue
+            bottom_line = med_s - self.mad_multiplier * mad_s
+            boundaries[tower_name] = bottom_line
+            kept_ids.update(
+                id(item)
+                for item, score in zip(group, raw_scores)
+                if score + epsilon >= bottom_line
+            )
+
+        valid: List[Tuple[PrunedChunk, EnhancedCandidateChunk]] = []
+        tower_kept: Dict[str, int] = defaultdict(int)
+        tower_dropped: Dict[str, int] = defaultdict(int)
+        for candidate in candidates:
+            tower_name = (
+                candidate.tower_source.value
+                if isinstance(candidate, EnhancedCandidateChunk)
+                else "UNKNOWN"
+            )
+            if id(candidate) in kept_ids:
+                valid.append(
+                    (PrunedChunk(chunk=candidate, confidence=ConfidenceLevel.HIGH), candidate)
+                )
+                tower_kept[tower_name] += 1
+            else:
+                tower_dropped[tower_name] += 1
+
+        logger.info(
+            f"[Stage 1] per-tower MAD bottom_lines={ {k: round(v, 4) for k, v in boundaries.items()} }"
+        )
+        logger.info(
+            f"[Stage 1] complete: kept={len(valid)}, dropped={len(candidates) - len(valid)} | "
+            f"kept_distribution={dict(tower_kept)} | dropped_distribution={dict(tower_dropped)}"
+        )
+        return valid
 
     def _stage2_disambiguate(
         self,
@@ -1136,6 +1215,7 @@ def create_cascade_pruner(
     cliff_tolerance: float = 2.0,
     absolute_min_score: float = 0.0,
     adaptive_dataset: Optional[str] = None,
+    use_raw_score: bool = False,
     **kwargs,
 ) -> CascadeConfidencePruner:
     """Parameters max_tokens : int lambda_mmr : float mode : str "budget_max" / "dynamic_adaptive")。 mad_multiplier : float cliff_tolerance : float absolute_min_score : float adaptive_dataset : Optional[str] **kwargs Returns CascadeConfidencePrune."""
@@ -1148,5 +1228,6 @@ def create_cascade_pruner(
         cliff_tolerance=cliff_tolerance,
         absolute_min_score=absolute_min_score,
         adaptive_dataset=adaptive_dataset,
+        use_raw_score=use_raw_score,
         **kwargs,
     )

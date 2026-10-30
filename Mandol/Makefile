@@ -4,6 +4,7 @@
 PYTHON_DIRS := src/mandol benchmark_locomo benchmark_longmemeval benchmark_self_host examples
 TEST_DIR := examples/mandol_chat/tests
 STORAGE_TEST := tests/test_rocksdb_tiered_cache.py
+CONSTRAINT_TESTS := tests/test_constraint_inference.py tests/test_constrained_towers.py tests/test_cascade_per_tower_mad.py
 
 install:
 	uv sync
@@ -18,7 +19,7 @@ artifact-cpu:
 	uv sync --extra dev --group spacy-model
 
 test:
-	uv run pytest $(STORAGE_TEST) $(TEST_DIR) -v
+	uv run pytest $(STORAGE_TEST) $(CONSTRAINT_TESTS) $(TEST_DIR) -v
 
 test-unit:
 	uv run pytest $(STORAGE_TEST) $(TEST_DIR)/test_benchmark_isolation.py -v

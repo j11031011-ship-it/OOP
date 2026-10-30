@@ -7,12 +7,14 @@ dispatch, cross-tower pruning, unified reranking, and quantification packaging.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from ..constraints import DEFAULT_MAX_SELECTIVITY, ConstraintAwarePlanner, ConstraintInferrer, QueryConstraints
 from ..core.memory_space_registry import TowerSpace
 from ..core.memory_unit import MemoryUnit
 from ..entity_relation.entity_relation_retriever import (
@@ -40,6 +42,12 @@ from ..retrieval.score_fusion import ScoreFusion
 from ..utils.logging_config import create_module_logger
 
 logger = create_module_logger("triple_retrieval.triple_tower_retriever")
+
+_TOWER_BY_SPACE_ROOT = {
+    "hierarchical_memory": "hierarchical",
+    "entity_relation": "graph",
+    "episodic_memory": "episodic",
+}
 
 
 class TripleTowerSearchMode(Enum):
@@ -99,6 +107,7 @@ class TripleTowerConfig:
 
     pruner_max_tokens: int = 2000
     pruner_mode: str = "dynamic_adaptive"
+    pruner_use_raw_score: bool = False
     pruner_lambda_mmr: float = 0.6
 
     def __post_init__(self) -> None:
@@ -197,6 +206,20 @@ class _RouteDecision:
     confidence: float
     reason: str
     raw_config: Any = None
+    constraint_info: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _ConstraintRouteContext:
+    """Resolved constraint decision, shared by routing and dispatch."""
+
+    branch: str = "none"
+    candidate_uids: Optional[List[str]] = None
+    space_names: List[str] = field(default_factory=list)
+    tower_flags: Optional[Dict[str, bool]] = None
+    selectivity: Optional[float] = None
+    skipped_towers: List[str] = field(default_factory=list)
+    info: Dict[str, Any] = field(default_factory=dict)
 
 
 class TripleTowerRetriever:
@@ -248,9 +271,17 @@ class TripleTowerRetriever:
             "avg_retrieval_time": 0.0,
         }
 
-    def search(self, query: str, config: Optional[TripleTowerConfig] = None, **kwargs) -> TripleTowerResult:
+    def search(
+        self,
+        query: str,
+        config: Optional[TripleTowerConfig] = None,
+        constraints: Union[str, QueryConstraints, None] = None,
+        **kwargs,
+    ) -> TripleTowerResult:
         start = time.time()
-        payload = self._execute_pipeline(query=query, cfg=config or self.config, **kwargs)
+        payload = self._execute_pipeline(
+            query=query, cfg=config or self.config, constraints=constraints, **kwargs
+        )
         tower_results = payload["tower_results"]
         result = TripleTowerResult(query=query, search_mode=(config or self.config).search_mode)
         result.hierarchical = tower_results["hierarchical"]
@@ -264,9 +295,17 @@ class TripleTowerRetriever:
         self._update_stats(result)
         return result
 
-    async def search_async(self, query: str, config: Optional[TripleTowerConfig] = None, **kwargs) -> TripleTowerResult:
+    async def search_async(
+        self,
+        query: str,
+        config: Optional[TripleTowerConfig] = None,
+        constraints: Union[str, QueryConstraints, None] = None,
+        **kwargs,
+    ) -> TripleTowerResult:
         start = time.time()
-        payload = await self._execute_pipeline_async(query=query, cfg=config or self.config, **kwargs)
+        payload = await self._execute_pipeline_async(
+            query=query, cfg=config or self.config, constraints=constraints, **kwargs
+        )
         tower_results = payload["tower_results"]
         result = TripleTowerResult(query=query, search_mode=(config or self.config).search_mode)
         result.hierarchical = tower_results["hierarchical"]
@@ -300,6 +339,7 @@ class TripleTowerRetriever:
         top_k: Optional[int] = None,
         rerank_method: Optional[str] = None,
         rerank_params: Optional[Dict[str, Any]] = None,
+        constraints: Union[str, QueryConstraints, None] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         cfg = kwargs.pop("config", self.config)
@@ -312,6 +352,7 @@ class TripleTowerRetriever:
             cfg=cfg,
             top_k=top_k,
             rerank_params=rerank_params,
+            constraints=constraints,
             **kwargs,
         )
         return {
@@ -327,6 +368,7 @@ class TripleTowerRetriever:
         top_k: Optional[int] = None,
         rerank_method: Optional[str] = None,
         rerank_params: Optional[Dict[str, Any]] = None,
+        constraints: Union[str, QueryConstraints, None] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         cfg = kwargs.pop("config", self.config)
@@ -339,6 +381,7 @@ class TripleTowerRetriever:
             cfg=cfg,
             top_k=top_k,
             rerank_params=rerank_params,
+            constraints=constraints,
             **kwargs,
         )
         return {
@@ -391,6 +434,7 @@ class TripleTowerRetriever:
         rerank_method: Optional[str] = "baai",
         rerank_params: Optional[Dict[str, Any]] = None,
         return_detailed: bool = False,
+        constraints: Union[str, QueryConstraints, None] = None,
         **kwargs,
     ) -> Union[List[Tuple[MemoryUnit, float]], Dict[str, Any]]:
         payload = self.tri_tower_search_quantification(
@@ -399,6 +443,7 @@ class TripleTowerRetriever:
             top_k=top_k,
             rerank_method=rerank_method,
             rerank_params=rerank_params,
+            constraints=constraints,
             **kwargs,
         )
         if not return_detailed:
@@ -413,6 +458,7 @@ class TripleTowerRetriever:
         rerank_method: Optional[str] = "baai",
         rerank_params: Optional[Dict[str, Any]] = None,
         return_detailed: bool = False,
+        constraints: Union[str, QueryConstraints, None] = None,
         **kwargs,
     ) -> Union[List[Tuple[MemoryUnit, float]], Dict[str, Any]]:
         payload = await self.tri_tower_search_quantification_async(
@@ -421,6 +467,7 @@ class TripleTowerRetriever:
             top_k=top_k,
             rerank_method=rerank_method,
             rerank_params=rerank_params,
+            constraints=constraints,
             **kwargs,
         )
         if not return_detailed:
@@ -439,6 +486,7 @@ class TripleTowerRetriever:
         cfg = config or self.config
         category = kwargs.pop("category", kwargs.pop("query_category", None))
         dataset = kwargs.pop("dataset", None)
+        kwargs.pop("constraints", None)
         route = self._route_towers(query, cfg, category=category, dataset=dataset)
         self._ensure_sync_rerank_allowed_for_route(
             cfg,
@@ -492,13 +540,25 @@ class TripleTowerRetriever:
         category = kwargs.pop("category", kwargs.pop("query_category", None))
         dataset = kwargs.pop("dataset", None)
         query_timestamp = float(kwargs.pop("query_timestamp", 0.0) or 0.0)
+        declared = kwargs.pop("constraints", None)
+        constraint_ctx = self._resolve_constraints(query, declared, query_timestamp or None)
         route = self._route_towers(query, cfg, category=category, dataset=dataset)
+        route = self._apply_constraint_route(route, cfg, constraint_ctx)
         self._ensure_sync_rerank_allowed_for_route(
             cfg,
             route,
             context="TripleTowerRetriever._execute_pipeline",
         )
-        tower_results, dispatch_info = self._dispatch_towers(query, cfg, route, **kwargs)
+        if self._constraint_short_circuits(route, constraint_ctx):
+            return self._empty_payload(route, constraint_ctx, cfg, time.time() - started)
+        tower_results, dispatch_info = self._dispatch_towers(
+            query,
+            cfg,
+            route,
+            candidate_uids=constraint_ctx.candidate_uids,
+            constraint_space_names=constraint_ctx.space_names,
+            **kwargs,
+        )
         candidates, candidate_units = self._build_candidates(tower_results)
         selected, context, prune_info = self._prune_candidates(
             candidates=candidates,
@@ -525,6 +585,7 @@ class TripleTowerRetriever:
             final_count=len(reranked),
             elapsed=time.time() - started,
         )
+        quantification["constraint"] = constraint_ctx.info
         return {
             "results": reranked,
             "context": context,
@@ -545,8 +606,20 @@ class TripleTowerRetriever:
         category = kwargs.pop("category", kwargs.pop("query_category", None))
         dataset = kwargs.pop("dataset", None)
         query_timestamp = float(kwargs.pop("query_timestamp", 0.0) or 0.0)
+        declared = kwargs.pop("constraints", None)
+        constraint_ctx = self._resolve_constraints(query, declared, query_timestamp or None)
         route = self._route_towers(query, cfg, category=category, dataset=dataset)
-        tower_results, dispatch_info = await self._dispatch_towers_async(query, cfg, route, **kwargs)
+        route = self._apply_constraint_route(route, cfg, constraint_ctx)
+        if self._constraint_short_circuits(route, constraint_ctx):
+            return self._empty_payload(route, constraint_ctx, cfg, time.time() - started)
+        tower_results, dispatch_info = await self._dispatch_towers_async(
+            query,
+            cfg,
+            route,
+            candidate_uids=constraint_ctx.candidate_uids,
+            constraint_space_names=constraint_ctx.space_names,
+            **kwargs,
+        )
         candidates, candidate_units = self._build_candidates(tower_results)
         selected, context, prune_info = self._prune_candidates(
             candidates=candidates,
@@ -573,6 +646,7 @@ class TripleTowerRetriever:
             final_count=len(reranked),
             elapsed=time.time() - started,
         )
+        quantification["constraint"] = constraint_ctx.info
         return {
             "results": reranked,
             "context": context,
@@ -654,6 +728,264 @@ class TripleTowerRetriever:
                 "router_fallback_all_towers",
             )
 
+    # ------------------------------------------------------------- constraints
+    def _resolve_constraints(
+        self,
+        query: str,
+        declared: Any,
+        reference_time: Optional[float],
+    ) -> _ConstraintRouteContext:
+        """Resolve ``constraints`` into a route context.
+
+        ``constraints`` accepts ``"auto"`` (infer from the query), an explicit
+        ``QueryConstraints`` (evaluation and debugging), or ``None`` (off).
+        """
+        info: Dict[str, Any] = {
+            "mode": "off",
+            "branch": "none",
+            "confidence": 0.0,
+            "source": "none",
+            "dropped": [],
+            "selectivity": None,
+            "applied": False,
+            "spaces": [],
+            "skipped_towers": [],
+            "budget": None,
+        }
+        context = _ConstraintRouteContext(info=info)
+        if declared is None:
+            return context
+
+        if isinstance(declared, str):
+            if declared.strip().lower() != "auto":
+                raise ValueError(
+                    f"constraints must be 'auto', QueryConstraints(...), or None; got {declared!r}."
+                )
+            inferrer = ConstraintInferrer(self.semantic_graph.semantic_map)
+            inferred = inferrer.infer(query, reference_time=reference_time)
+            info.update(
+                mode="auto",
+                confidence=round(inferred.confidence, 4),
+                source=inferred.source,
+                dropped=list(inferred.dropped),
+            )
+            constraints = inferred.constraints
+            if constraints is None or constraints.is_empty():
+                info["gap"] = "no_constraint"
+                return context
+            if inferred.confidence < inferrer.min_confidence:
+                info["gap"] = "low_confidence"
+                return context
+            max_selectivity = inferrer.max_selectivity
+        elif isinstance(declared, QueryConstraints):
+            constraints = declared
+            info.update(mode="explicit", confidence=1.0, source="declared")
+            max_selectivity = DEFAULT_MAX_SELECTIVITY
+        else:
+            raise TypeError(
+                "constraints must be 'auto', QueryConstraints(...), or None; "
+                f"got {type(declared).__name__}."
+            )
+
+        if constraints.is_empty():
+            return context
+
+        info["applied"] = True
+        spaces = [str(name) for name in (constraints.space_names or [])]
+        context.space_names = spaces
+        info["spaces"] = spaces
+
+        only_space = bool(spaces) and not (
+            constraints.metadata_filters
+            or constraints.time_range
+            or constraints.relation
+        )
+        if only_space:
+            addressable = self._addressable_spaces()
+            if all(name in addressable for name in spaces):
+                context.branch = "space_only"
+                info["branch"] = "space_only"
+                context.tower_flags = self._tower_flags_for_spaces(spaces)
+                return context
+            info["gap"] = "space_not_addressable"
+
+        planner = ConstraintAwarePlanner(self.semantic_graph)
+        candidate_set = planner.resolve_candidates(constraints)
+        if candidate_set is None:
+            info.update(applied=False, gap="unresolved")
+            return context
+        if len(candidate_set) == 0:
+            context.branch = "empty"
+            info.update(branch="empty", applied=False)
+            return context
+
+        selectivity = candidate_set.selectivity
+        if selectivity is None:
+            total = int(getattr(self.semantic_graph.semantic_map, "total_unit_count", 0) or 0)
+            selectivity = len(candidate_set) / total if total else 1.0
+        info["selectivity"] = round(float(selectivity), 6)
+        if selectivity > max_selectivity:
+            context.branch = "too_broad"
+            info.update(branch="too_broad", applied=False, gap="too_broad")
+            return context
+
+        context.branch = "filtered"
+        context.selectivity = float(selectivity)
+        context.candidate_uids = sorted(candidate_set.uids)
+        info["branch"] = "filtered"
+        if spaces:
+            context.tower_flags = self._tower_flags_for_spaces(spaces)
+        return context
+
+    def _apply_constraint_route(
+        self,
+        route: _RouteDecision,
+        cfg: TripleTowerConfig,
+        context: _ConstraintRouteContext,
+    ) -> _RouteDecision:
+        """Fold a resolved constraint context into the router decision."""
+        info = context.info
+        if context.branch not in ("space_only", "filtered"):
+            return replace(route, constraint_info=info)
+
+        flags = {
+            "hierarchical": route.enable_hierarchical,
+            "graph": route.enable_graph,
+            "episodic": route.enable_episodic,
+        }
+        if context.tower_flags is not None:
+            flags = {name: flags[name] and context.tower_flags[name] for name in flags}
+
+        if context.candidate_uids and context.space_names:
+            semantic_map = self.semantic_graph.semantic_map
+            for name in ("hierarchical", "graph", "episodic"):
+                tower_spaces = self._spaces_for_tower(name, context.space_names)
+                if not tower_spaces or not flags[name]:
+                    continue
+                intersection = semantic_map._get_candidate_uids_set(
+                    tower_spaces, context.candidate_uids
+                )
+                if intersection is not None and len(intersection) == 0:
+                    flags[name] = False
+                    context.skipped_towers.append(name)
+
+        topk = {
+            "hierarchical": route.topk_hierarchical,
+            "graph": route.topk_graph,
+            "episodic": route.topk_episodic,
+        }
+        if context.selectivity:
+            for name in topk:
+                if not flags[name]:
+                    continue
+                topk[name] = max(
+                    1,
+                    min(
+                        math.ceil(topk[name] / context.selectivity),
+                        4 * topk[name],
+                    ),
+                )
+            info["budget"] = {
+                "selectivity": round(context.selectivity, 6),
+                **{f"topk_{name}": value for name, value in topk.items()},
+            }
+        info["skipped_towers"] = list(context.skipped_towers)
+
+        return replace(
+            route,
+            enable_hierarchical=flags["hierarchical"],
+            enable_graph=flags["graph"],
+            enable_episodic=flags["episodic"],
+            topk_hierarchical=topk["hierarchical"],
+            topk_graph=topk["graph"],
+            topk_episodic=topk["episodic"],
+            active_towers=self._active_tower_names(
+                flags["hierarchical"], flags["graph"], flags["episodic"]
+            ),
+            reason=f"{route.reason}+constraint:{context.branch}",
+            constraint_info=info,
+        )
+
+    @staticmethod
+    def _constraint_short_circuits(
+        route: _RouteDecision, context: _ConstraintRouteContext
+    ) -> bool:
+        if context.branch == "empty":
+            return True
+        return context.branch in ("space_only", "filtered") and not route.active_towers
+
+    def _empty_payload(
+        self,
+        route: _RouteDecision,
+        context: _ConstraintRouteContext,
+        cfg: TripleTowerConfig,
+        elapsed: float,
+    ) -> Dict[str, Any]:
+        """Return the full pipeline payload for a query with no candidates."""
+        tower_results = self._empty_tower_results()
+        prune_info = {
+            "stage1_input_count": 0,
+            "stage1_output_count": 0,
+            "selected_count": 0,
+            "error": "constraint_empty",
+        }
+        quantification = self._build_quantification(
+            route=route,
+            dispatch_info=self._dispatch_info("skipped", 0.0, tower_results),
+            prune_info=prune_info,
+            tower_results=tower_results,
+            candidate_count=0,
+            selected_count=0,
+            final_count=0,
+            elapsed=elapsed,
+        )
+        quantification["constraint"] = context.info
+        return {
+            "results": [],
+            "context": "",
+            "quantification": quantification,
+            "tower_results": tower_results,
+            "rerank_result": self._build_rerank_result(tower_results, [], [], cfg),
+        }
+
+    def _addressable_spaces(self) -> set:
+        mounted = getattr(self.semantic_graph.semantic_map, "memory_spaces", {}) or {}
+        return {space.value for space in TowerSpace if space.value in mounted}
+
+    @staticmethod
+    def _tower_flags_for_spaces(spaces: List[str]) -> Dict[str, bool]:
+        towers = {_TOWER_BY_SPACE_ROOT.get(name.split(":", 1)[0]) for name in spaces}
+        return {
+            "hierarchical": "hierarchical" in towers,
+            "graph": "graph" in towers,
+            "episodic": "episodic" in towers,
+        }
+
+    @staticmethod
+    def _spaces_for_tower(tower: str, space_names: List[str]) -> List[str]:
+        root = {
+            "hierarchical": "hierarchical_memory",
+            "graph": "entity_relation",
+            "episodic": "episodic_memory",
+        }[tower]
+        return [name for name in space_names if name.split(":", 1)[0] == root]
+
+    @staticmethod
+    def _tower_search_kwargs(tower: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Select only the kwargs a tower backend understands.
+
+        ``constraints`` and ``constraint_space_names`` are pipeline-level and
+        must never reach ``smart_search``; the hierarchical tower already gets
+        its methods as ``retrieval_methods``, so ``methods`` is not forwarded.
+        """
+        search_kwargs: Dict[str, Any] = {}
+        if tower != "hierarchical" and kwargs.get("methods") is not None:
+            search_kwargs["methods"] = kwargs["methods"]
+        candidate_uids = kwargs.get("candidate_uids")
+        if candidate_uids is not None:
+            search_kwargs["candidate_uids"] = list(candidate_uids)
+        return search_kwargs
+
     def _dispatch_towers(
         self,
         query: str,
@@ -728,6 +1060,12 @@ class TripleTowerRetriever:
         started = time.time()
         result = HierarchicalTowerResult(stats=TowerRetrievalStats(enabled=True))
         methods = kwargs.get("methods", cfg.hierarchical_methods)
+        tower_kwargs = self._tower_search_kwargs("hierarchical", kwargs)
+        spaces = self._spaces_for_tower(
+            "hierarchical", kwargs.get("constraint_space_names") or []
+        )
+        if spaces:
+            tower_kwargs["space_names"] = spaces
         search_result = self.hierarchical_retriever.hierarchical_search(
             query=query,
             config=HierarchicalSearchConfig(
@@ -737,6 +1075,7 @@ class TripleTowerRetriever:
             top_k=route.topk_hierarchical,
             retrieval_methods=methods,
             rerank_method=cfg.hierarchical_rerank_method,
+            **tower_kwargs,
         )
         result.l0_results = self._retrieval_results_to_tuples(
             search_result.results_by_layer.get(MemoryLevel.OBSERVATION, [])
@@ -759,6 +1098,12 @@ class TripleTowerRetriever:
         started = time.time()
         result = HierarchicalTowerResult(stats=TowerRetrievalStats(enabled=True))
         methods = kwargs.get("methods", cfg.hierarchical_methods)
+        tower_kwargs = self._tower_search_kwargs("hierarchical", kwargs)
+        spaces = self._spaces_for_tower(
+            "hierarchical", kwargs.get("constraint_space_names") or []
+        )
+        if spaces:
+            tower_kwargs["space_names"] = spaces
         search_result = await self.hierarchical_retriever.hierarchical_search_async(
             query=query,
             config=HierarchicalSearchConfig(
@@ -768,6 +1113,7 @@ class TripleTowerRetriever:
             top_k=route.topk_hierarchical,
             retrieval_methods=methods,
             rerank_method=cfg.hierarchical_rerank_method,
+            **tower_kwargs,
         )
         result.l0_results = self._retrieval_results_to_tuples(
             search_result.results_by_layer.get(MemoryLevel.OBSERVATION, [])
@@ -787,15 +1133,16 @@ class TripleTowerRetriever:
     def _run_graph_tower(self, query: str, cfg: TripleTowerConfig, route: _RouteDecision, **kwargs) -> GraphTowerResult:
         started = time.time()
         result = GraphTowerResult(stats=TowerRetrievalStats(enabled=True))
-        search_kwargs = {}
-        if kwargs.get("methods") is not None:
-            search_kwargs["methods"] = kwargs["methods"]
+        search_kwargs = self._tower_search_kwargs("graph", kwargs)
         result.results = self.graph_retriever.entity_relation_search(
             query=query,
             top_k=route.topk_graph,
             final_topk=route.topk_graph,
             rerank_method=cfg.graph_rerank_method,
-            space_names=[cfg.graph_target_space],
+            space_names=self._spaces_for_tower(
+                "graph", kwargs.get("constraint_space_names") or []
+            )
+            or [cfg.graph_target_space],
             **search_kwargs,
         )
         result.context_text = self._format_context("Knowledge Graph", result.results)
@@ -809,15 +1156,16 @@ class TripleTowerRetriever:
     ) -> GraphTowerResult:
         started = time.time()
         result = GraphTowerResult(stats=TowerRetrievalStats(enabled=True))
-        search_kwargs = {}
-        if kwargs.get("methods") is not None:
-            search_kwargs["methods"] = kwargs["methods"]
+        search_kwargs = self._tower_search_kwargs("graph", kwargs)
         result.results = await self.graph_retriever.entity_relation_search_async(
             query=query,
             top_k=route.topk_graph,
             final_topk=route.topk_graph,
             rerank_method=cfg.graph_rerank_method,
-            space_names=[cfg.graph_target_space],
+            space_names=self._spaces_for_tower(
+                "graph", kwargs.get("constraint_space_names") or []
+            )
+            or [cfg.graph_target_space],
             **search_kwargs,
         )
         result.context_text = self._format_context("Knowledge Graph", result.results)
@@ -829,14 +1177,15 @@ class TripleTowerRetriever:
     def _run_episodic_tower(self, query: str, cfg: TripleTowerConfig, route: _RouteDecision, **kwargs) -> EpisodicTowerResult:
         started = time.time()
         result = EpisodicTowerResult(stats=TowerRetrievalStats(enabled=True))
-        search_kwargs = {}
-        if kwargs.get("methods") is not None:
-            search_kwargs["methods"] = kwargs["methods"]
+        search_kwargs = self._tower_search_kwargs("episodic", kwargs)
         result.results = self.episodic_retriever.episodic_search(
             query=query,
             top_k=route.topk_episodic,
             rerank_method=cfg.episodic_rerank_method,
-            space_names=[cfg.episodic_target_space],
+            space_names=self._spaces_for_tower(
+                "episodic", kwargs.get("constraint_space_names") or []
+            )
+            or [cfg.episodic_target_space],
             **search_kwargs,
         )
         result.context_with_time = self.episodic_retriever.build_context_with_time_injection(result.results)
@@ -851,14 +1200,15 @@ class TripleTowerRetriever:
     ) -> EpisodicTowerResult:
         started = time.time()
         result = EpisodicTowerResult(stats=TowerRetrievalStats(enabled=True))
-        search_kwargs = {}
-        if kwargs.get("methods") is not None:
-            search_kwargs["methods"] = kwargs["methods"]
+        search_kwargs = self._tower_search_kwargs("episodic", kwargs)
         result.results = await self.episodic_retriever.episodic_search_async(
             query=query,
             top_k=route.topk_episodic,
             rerank_method=cfg.episodic_rerank_method,
-            space_names=[cfg.episodic_target_space],
+            space_names=self._spaces_for_tower(
+                "episodic", kwargs.get("constraint_space_names") or []
+            )
+            or [cfg.episodic_target_space],
             **search_kwargs,
         )
         result.context_with_time = self.episodic_retriever.build_context_with_time_injection(result.results)
@@ -908,7 +1258,7 @@ class TripleTowerRetriever:
                     timestamp=self._extract_timestamp(unit),
                     entity_ids=self._extract_entity_ids(unit),
                     memory_space=self._infer_memory_space(source),
-                    raw_metadata={"uid": unit.uid, "tower": tower_name, "original_score": float(score), **(unit.metadata or {})},
+                    raw_metadata={**(unit.metadata or {}), "uid": unit.uid, "tower": tower_name, "original_score": float(score)},
                 )
             )
         return candidates, candidate_units
@@ -929,6 +1279,7 @@ class TripleTowerRetriever:
                 lambda_mmr=cfg.pruner_lambda_mmr,
                 mode=cfg.pruner_mode,
                 adaptive_dataset=route.dataset,
+                use_raw_score=cfg.pruner_use_raw_score,
             )
             pruned = pruner.prune(candidates, query_timestamp=query_timestamp, query_category=route.category)
             selected: List[Tuple[MemoryUnit, float]] = []

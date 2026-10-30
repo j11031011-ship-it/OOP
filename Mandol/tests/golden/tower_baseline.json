@@ -1,0 +1,8 @@
+{
+  "alpha": ["g0", "e0", "h0", "h1", "h2", "e1"],
+  "alpha conversation": ["g0", "e0", "e1", "h0", "h1", "h2"],
+  "beta": ["e1", "g0", "e0"],
+  "alpha insight": ["g0", "e0", "h0", "h1", "h2", "e1"],
+  "no-such-token": ["g0", "e1", "e0"],
+  "昨天的 alpha": ["g0", "e0", "h0", "h1", "h2", "e1"]
+}

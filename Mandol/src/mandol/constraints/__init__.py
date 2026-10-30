@@ -24,6 +24,13 @@ incrementally maintained index-backed fast paths live in ``mandol.indexes``.
 
 from .candidate_set import CandidateSet
 from .fallback import DROP_CONSTRAINT, RETURN_EMPTY, FallbackPolicy
+from .inference import (
+    DEFAULT_MAX_SELECTIVITY,
+    DEFAULT_MIN_CONFIDENCE,
+    ConstraintInferrer,
+    InferenceSchema,
+    InferredConstraints,
+)
 from .planner import ConstraintAwarePlanner, ConstraintExecutionPlan
 from .query_constraints import QueryConstraints, RelationConstraint, TimeRange
 from .resolvers import (
@@ -38,8 +45,13 @@ __all__ = [
     "CandidateSet",
     "ConstraintAwarePlanner",
     "ConstraintExecutionPlan",
+    "ConstraintInferrer",
+    "DEFAULT_MAX_SELECTIVITY",
+    "DEFAULT_MIN_CONFIDENCE",
     "DROP_CONSTRAINT",
     "FallbackPolicy",
+    "InferenceSchema",
+    "InferredConstraints",
     "QueryConstraints",
     "RETURN_EMPTY",
     "RelationConstraint",
