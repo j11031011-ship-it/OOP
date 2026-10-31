@@ -110,6 +110,9 @@ class TripleTowerConfig:
     pruner_use_raw_score: bool = False
     pruner_lambda_mmr: float = 0.6
 
+    constraint_llm_client: Optional[Any] = None
+    constraint_llm_timeout: float = 2.0
+
     def __post_init__(self) -> None:
         if self.hierarchical_methods is None:
             self.hierarchical_methods = ["bm25", "cosine_similarity", "splade"]
@@ -275,7 +278,7 @@ class TripleTowerRetriever:
         self,
         query: str,
         config: Optional[TripleTowerConfig] = None,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> TripleTowerResult:
         start = time.time()
@@ -299,7 +302,7 @@ class TripleTowerRetriever:
         self,
         query: str,
         config: Optional[TripleTowerConfig] = None,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> TripleTowerResult:
         start = time.time()
@@ -339,7 +342,7 @@ class TripleTowerRetriever:
         top_k: Optional[int] = None,
         rerank_method: Optional[str] = None,
         rerank_params: Optional[Dict[str, Any]] = None,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> Dict[str, Any]:
         cfg = kwargs.pop("config", self.config)
@@ -368,7 +371,7 @@ class TripleTowerRetriever:
         top_k: Optional[int] = None,
         rerank_method: Optional[str] = None,
         rerank_params: Optional[Dict[str, Any]] = None,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> Dict[str, Any]:
         cfg = kwargs.pop("config", self.config)
@@ -434,7 +437,7 @@ class TripleTowerRetriever:
         rerank_method: Optional[str] = "baai",
         rerank_params: Optional[Dict[str, Any]] = None,
         return_detailed: bool = False,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> Union[List[Tuple[MemoryUnit, float]], Dict[str, Any]]:
         payload = self.tri_tower_search_quantification(
@@ -458,7 +461,7 @@ class TripleTowerRetriever:
         rerank_method: Optional[str] = "baai",
         rerank_params: Optional[Dict[str, Any]] = None,
         return_detailed: bool = False,
-        constraints: Union[str, QueryConstraints, None] = None,
+        constraints: Union[str, QueryConstraints, None] = "auto",
         **kwargs,
     ) -> Union[List[Tuple[MemoryUnit, float]], Dict[str, Any]]:
         payload = await self.tri_tower_search_quantification_async(
@@ -761,7 +764,11 @@ class TripleTowerRetriever:
                 raise ValueError(
                     f"constraints must be 'auto', QueryConstraints(...), or None; got {declared!r}."
                 )
-            inferrer = ConstraintInferrer(self.semantic_graph.semantic_map)
+            inferrer = ConstraintInferrer(
+                self.semantic_graph.semantic_map,
+                llm_client=self.config.constraint_llm_client,
+                llm_timeout=self.config.constraint_llm_timeout,
+            )
             inferred = inferrer.infer(query, reference_time=reference_time)
             info.update(
                 mode="auto",

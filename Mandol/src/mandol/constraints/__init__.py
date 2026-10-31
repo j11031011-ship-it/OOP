@@ -23,6 +23,15 @@ incrementally maintained index-backed fast paths live in ``mandol.indexes``.
 """
 
 from .candidate_set import CandidateSet
+from .evaluation import (
+    ExtractionScore,
+    TypeScore,
+    canonical_predicates,
+    empty_result_rate,
+    recall_at_k,
+    score_extraction,
+    score_predictions,
+)
 from .fallback import DROP_CONSTRAINT, RETURN_EMPTY, FallbackPolicy
 from .inference import (
     DEFAULT_MAX_SELECTIVITY,
@@ -49,6 +58,7 @@ __all__ = [
     "DEFAULT_MAX_SELECTIVITY",
     "DEFAULT_MIN_CONFIDENCE",
     "DROP_CONSTRAINT",
+    "ExtractionScore",
     "FallbackPolicy",
     "InferenceSchema",
     "InferredConstraints",
@@ -56,6 +66,12 @@ __all__ = [
     "RETURN_EMPTY",
     "RelationConstraint",
     "TimeRange",
+    "TypeScore",
+    "canonical_predicates",
+    "empty_result_rate",
+    "recall_at_k",
+    "score_extraction",
+    "score_predictions",
     "BaseConstraintResolver",
     "MetadataConstraintResolver",
     "RelationConstraintResolver",

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from mandol.constraints import ConstraintInferrer
+from mandol.core.memory_unit import MemoryUnit
 
 DAY = 86400.0
 
@@ -157,3 +159,187 @@ def test_combined_constraints_take_minimum_confidence(inferrer):
     assert inferred.constraints.space_names == ["episodic_memory"]
     assert inferred.constraints.time_range is not None
     assert inferred.confidence == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
+# M1c: LLM fallback
+# ---------------------------------------------------------------------------
+
+LLM_QUERY = "帮我筛一下只属于 speaker_a 的对话"
+
+
+class _FakeLLMClient:
+    def __init__(self, reply: str = "{}", *, delay: float = 0.0, error: Exception = None):
+        self.reply = reply
+        self.delay = delay
+        self.error = error
+        self.calls = 0
+        self.prompts = []
+
+    def generate_answer(self, prompt, max_tokens=None, temperature=None):
+        self.calls += 1
+        self.prompts.append(prompt)
+        assert temperature == 0.0
+        if self.delay:
+            time.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.reply
+
+
+def _llm_inferrer(graph, client, **kwargs):
+    return ConstraintInferrer(graph.semantic_map, llm_client=client, **kwargs)
+
+
+def test_rule_hit_skips_the_llm(tower_graph_factory):
+    client = _FakeLLMClient('{"metadata_filters": {"speaker": {"eq": "speaker_b"}}}')
+    inferrer = _llm_inferrer(tower_graph_factory(), client)
+    inferred = inferrer.infer("speaker 是 speaker_a")
+    assert inferred.source == "rule"
+    assert inferred.constraints.metadata_filters == {"speaker": {"eq": "speaker_a"}}
+    assert client.calls == 0
+
+
+def test_llm_fallback_returns_validated_constraints(tower_graph_factory):
+    client = _FakeLLMClient(
+        '{"confidence": 0.8, "metadata_filters": {"speaker": {"eq": "speaker_a"}}}'
+    )
+    inferrer = _llm_inferrer(tower_graph_factory(), client)
+    inferred = inferrer.infer(LLM_QUERY)
+    assert inferred.source == "llm"
+    assert inferred.confidence == pytest.approx(0.8)
+    assert inferred.constraints.metadata_filters == {"speaker": {"eq": "speaker_a"}}
+    assert inferred.evidence["attribute"] == ["llm:speaker:eq"]
+    assert client.calls == 1
+    prompt = client.prompts[0]
+    assert "speaker" in prompt and "speaker_a" in prompt and "timestamp" in prompt
+
+
+def test_llm_cache_serves_repeated_queries(tower_graph_factory):
+    client = _FakeLLMClient('{"metadata_filters": {"speaker": {"eq": "speaker_a"}}}')
+    inferrer = _llm_inferrer(tower_graph_factory(), client)
+    first = inferrer.infer(LLM_QUERY)
+    second = inferrer.infer(LLM_QUERY)
+    assert client.calls == 1
+    assert second.source == "llm"
+    assert second.dropped == first.dropped
+    second.dropped.append("mutated")
+    assert first.dropped == []
+
+
+def test_llm_cache_key_tracks_schema_version(tower_graph_factory):
+    graph = tower_graph_factory()
+    client = _FakeLLMClient('{"metadata_filters": {"speaker": {"eq": "speaker_a"}}}')
+    inferrer = _llm_inferrer(graph, client)
+    assert inferrer.infer(LLM_QUERY).source == "llm"
+    graph.semantic_map.add_unit(
+        MemoryUnit(
+            "extra",
+            {
+                "text_content": "extra note",
+                "speaker": "speaker_c",
+                "timestamp": "2024-01-11T08:00:00",
+            },
+        ),
+        explicit_content_for_embedding="extra note",
+        space_names=["hierarchical_memory:L0_Observation"],
+        generate_sparse_embedding=False,
+    )
+    assert inferrer.infer(LLM_QUERY).source == "llm"
+    assert client.calls == 2
+
+
+def test_llm_invalid_json_fails_open(tower_graph_factory):
+    inferrer = _llm_inferrer(tower_graph_factory(), _FakeLLMClient("not json at all"))
+    inferred = inferrer.infer(LLM_QUERY)
+    assert inferred.constraints is None
+    assert inferred.source == "rule"
+    assert "llm: invalid JSON response" in inferred.dropped
+
+
+def test_llm_reply_with_code_fence_is_parsed(tower_graph_factory):
+    client = _FakeLLMClient(
+        '```json\n{"metadata_filters": {"speaker": {"eq": "speaker_a"}}}\n```'
+    )
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.source == "llm"
+    assert inferred.constraints.metadata_filters == {"speaker": {"eq": "speaker_a"}}
+
+
+def test_llm_timeout_fails_open(tower_graph_factory):
+    client = _FakeLLMClient('{"metadata_filters": {"speaker": {"eq": "speaker_a"}}}', delay=0.4)
+    inferrer = _llm_inferrer(tower_graph_factory(), client, llm_timeout=0.05)
+    started = time.perf_counter()
+    inferred = inferrer.infer(LLM_QUERY)
+    elapsed = time.perf_counter() - started
+    assert inferred.constraints is None
+    assert inferred.dropped == ["llm: timeout after 0.05s"]
+    assert elapsed < 0.3
+
+
+def test_llm_exception_fails_open(tower_graph_factory):
+    inferrer = _llm_inferrer(tower_graph_factory(), _FakeLLMClient(error=RuntimeError("boom")))
+    inferred = inferrer.infer(LLM_QUERY)
+    assert inferred.constraints is None
+    assert inferred.dropped == ["llm: RuntimeError: boom"]
+
+
+def test_llm_predicates_are_validated_against_the_schema(tower_graph_factory):
+    client = _FakeLLMClient(
+        '{"metadata_filters": {'
+        '"ghost": {"eq": "x"}, '
+        '"speaker": {"eq": "ghost"}, '
+        '"timestamp": {"contain": "2024"}}}'
+    )
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.constraints is None
+    assert "llm: field 'ghost' not in schema" in inferred.dropped
+    assert "llm: field 'speaker': value 'ghost' not observed" in inferred.dropped
+    assert "llm: field 'timestamp': operator 'contain' not allowed" in inferred.dropped
+
+
+def test_llm_accepts_unobserved_sorted_values(tower_graph_factory):
+    client = _FakeLLMClient(
+        '{"metadata_filters": {"timestamp": {"gte": "2024-01-06"}}}'
+    )
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.constraints.metadata_filters == {"timestamp": {"gte": "2024-01-06"}}
+
+
+def test_llm_unmounted_space_is_dropped(tower_graph_factory):
+    client = _FakeLLMClient('{"space_names": ["ghost_space"]}')
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.constraints is None
+    assert "llm: space: ghost_space: not mounted" in inferred.dropped
+
+
+def test_llm_time_range_is_validated(tower_graph_factory):
+    client = _FakeLLMClient(
+        '{"time_range": {"start": "2024-01-05T00:00:00", "end": "2024-01-06T00:00:00"}}'
+    )
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.constraints.time_range.start == _epoch(2024, 1, 5)
+    assert inferred.constraints.time_range.end == _epoch(2024, 1, 6)
+    assert inferred.evidence["time"] == ["llm"]
+
+
+def test_llm_inverted_time_range_is_dropped(tower_graph_factory):
+    client = _FakeLLMClient('{"time_range": {"start": 200, "end": 100}}')
+    inferred = _llm_inferrer(tower_graph_factory(), client).infer(LLM_QUERY)
+    assert inferred.constraints is None
+    assert "llm: time: start after end" in inferred.dropped
+
+
+def test_llm_fallback_is_wired_through_retriever_config(tower_retriever_factory):
+    client = _FakeLLMClient('{"metadata_filters": {"speaker": {"eq": "speaker_a"}}}')
+    retriever, _graph = tower_retriever_factory(
+        constraint_llm_client=client, constraint_llm_timeout=1.0
+    )
+    payload = retriever.tri_tower_search_quantification(
+        LLM_QUERY, top_k=5, constraints="auto"
+    )
+    info = payload["quantification"]["constraint"]
+    assert info["source"] == "llm"
+    assert info["branch"] == "filtered"
+    assert {unit.uid for unit, _score in payload["results"]} <= {"h0", "h2", "e0"}
+    assert client.calls == 1

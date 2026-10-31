@@ -71,6 +71,10 @@ l2_database/
 # allowing dataset README files to document the expected download locations.
 # =============================================================================
 data/
+# 50 条约束 gold 集是测试夹具（tests/test_constraint_evaluation.py 会校验其完整性），需入库
+!examples/data/
+examples/data/*
+!examples/data/constraint_gold.jsonl
 datasets/
 dataset/
 */datasets/
@@ -161,7 +165,7 @@ backup.sh
 # =============================================================================
 # Personal documents (local only, not pushed)
 # =============================================================================
-个人增加文档/
+_文档/
 
 # =============================================================================
 # Evaluation outputs

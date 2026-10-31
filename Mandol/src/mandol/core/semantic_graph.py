@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..constraints.query_constraints import QueryConstraints
     from ..retrieval.advance_retriever import MultiRetriever
     from ..storage.rocksdb_payload_store import RocksDBPayloadStore
+    from ..triple_retrieval.triple_tower_retriever import TripleTowerRetriever
 
 from .semantic_map import SemanticMap
 from .memory_unit import MemoryUnit
@@ -1115,16 +1116,23 @@ class SemanticGraph:
     def search_constrained(
         self,
         query_text: str,
-        constraints: Optional["QueryConstraints"] = None,
+        constraints: Optional[Union[str, "QueryConstraints"]] = None,
         top_k: int = 10,
         return_score: bool = False,
         prefilter_selectivity_threshold: Optional[float] = None,
         fallback_policy: Optional["FallbackPolicy"] = None,
+        use_unified: bool = False,
         **kwargs,
     ) -> Union[List[MemoryUnit], List[Tuple[MemoryUnit, float]]]:
         """Run constraint-aware hybrid retrieval over the graph layer.
 
-        The facade delegates to ``ConstraintAwarePlanner``: every declared
+        With ``use_unified=True`` and an explicit constraint bundle, the facade
+        delegates to ``TripleTowerRetriever.tri_tower_search_quantification``,
+        so callers share one implementation with the triple-tower entry
+        (``constraints="auto"`` is accepted too). The planner path below stays
+        the default until bench evaluation justifies flipping the switch.
+
+        The legacy path delegates to ``ConstraintAwarePlanner``: every declared
         constraint is resolved into a candidate UID set (index-backed when the
         corresponding fields are registered through
         ``SemanticMap.register_filterable_fields``), the sets are intersected
@@ -1135,17 +1143,19 @@ class SemanticGraph:
 
         Args:
             query_text: Query text passed to the underlying retriever.
-            constraints: Declarative constraint bundle; ``None`` behaves like
-                an empty bundle (plain smart search).
+            constraints: Declarative constraint bundle, ``"auto"`` for
+                inference, or ``None`` for plain smart search.
             top_k: Number of results to return after filtering.
             return_score: Whether to return ``(unit, score)`` tuples instead of
                 bare memory units.
             prefilter_selectivity_threshold: Override the candidate fraction
-                below which ``candidate_uids`` is pushed down.
+                below which ``candidate_uids`` is pushed down (legacy path).
             fallback_policy: Override how degenerate (empty or too small)
-                candidate sets are handled.
-            **kwargs: Additional ``MultiRetriever.smart_search`` options such as
-                ``methods`` or ``fusion_method``.
+                candidate sets are handled (legacy path).
+            use_unified: Delegate explicit constraints to the triple-tower
+                entry instead of the planner.
+            **kwargs: Additional retrieval options forwarded to the chosen
+                implementation (for example ``methods`` or ``fusion_method``).
 
         Returns:
             Ranked memory units (or ``(unit, score)`` tuples) satisfying every
@@ -1156,6 +1166,23 @@ class SemanticGraph:
             ConstraintAwarePlanner,
         )
         from ..constraints.query_constraints import QueryConstraints
+
+        if (
+            use_unified
+            and constraints is not None
+            and prefilter_selectivity_threshold is None
+            and fallback_policy is None
+        ):
+            payload = self._get_unified_tower_retriever().tri_tower_search_quantification(
+                query=query_text,
+                top_k=top_k,
+                constraints=constraints,
+                **kwargs,
+            )
+            results = payload["results"]
+            if return_score:
+                return results
+            return [unit for unit, _ in results]
 
         planner = ConstraintAwarePlanner(
             self,
@@ -1175,6 +1202,36 @@ class SemanticGraph:
         if return_score:
             return results
         return [unit for unit, _ in results]
+
+    def _get_unified_tower_retriever(self) -> "TripleTowerRetriever":
+        """Return the triple-tower retriever shared by delegated calls.
+
+        Routing and second-stage reranking stay off so the facade keeps the
+        planner's reach (every tower is searched every time) and adds no model
+        dependency; callers that want routing use the triple-tower entry.
+        """
+        retriever = getattr(self, "_unified_tower_retriever", None)
+        if retriever is not None:
+            return retriever
+        from ..triple_retrieval.triple_tower_retriever import (
+            RerankStrategy,
+            TripleTowerConfig,
+            TripleTowerRetriever,
+        )
+
+        retriever = TripleTowerRetriever(
+            self,
+            config=TripleTowerConfig(
+                enable_routing=False,
+                enable_second_stage_rerank=False,
+                rerank_strategy=RerankStrategy.NONE,
+                hierarchical_rerank_method=None,
+                graph_rerank_method=None,
+                episodic_rerank_method=None,
+            ),
+        )
+        self._unified_tower_retriever = retriever
+        return retriever
 
     def search_graph_nodes(self, 
                         query: str, 

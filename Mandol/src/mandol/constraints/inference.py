@@ -18,11 +18,19 @@ Two guards keep a wrong guess from silently emptying the result set:
 Relation constraints are deliberately not produced: resolving "Alice 的朋友"
 needs a name-to-UID resolver that does not exist yet, and inventing seed UIDs
 would narrow the pool to nothing.
+
+When rules find nothing and an ``llm_client`` is configured, a JSON-only prompt
+asks the model for the same leaves. The reply is validated through the same
+``InferenceSchema`` guards before it can narrow anything, and a timeout or a
+malformed answer fails open (no constraints) so retrieval still runs.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
@@ -32,9 +40,14 @@ from .query_constraints import QueryConstraints, TimeRange
 
 DEFAULT_MIN_CONFIDENCE = 0.7
 DEFAULT_MAX_SELECTIVITY = 0.8
+DEFAULT_LLM_TIMEOUT = 2.0
+DEFAULT_LLM_CACHE_SIZE = 512
 
 _SCHEMA_SAMPLE_SIZE = 200
 _SECONDS_PER_DAY = 86400.0
+_LLM_DEFAULT_CONFIDENCE = 0.75
+_LLM_SAMPLE_VALUES = 8
+_LLM_MAX_TOKENS = 256
 
 _OPERATORS_BY_KIND: Dict[str, FrozenSet[str]] = {
     "hash": frozenset({"eq", "ne", "in", "nin"}),
@@ -132,13 +145,20 @@ class ConstraintInferrer:
         *,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         max_selectivity: float = DEFAULT_MAX_SELECTIVITY,
+        llm_client: Optional[Any] = None,
+        llm_timeout: float = DEFAULT_LLM_TIMEOUT,
+        llm_cache_size: int = DEFAULT_LLM_CACHE_SIZE,
     ):
         self.semantic_map = semantic_map
         self.min_confidence = float(min_confidence)
         self.max_selectivity = float(max_selectivity)
+        self.llm_client = llm_client
+        self.llm_timeout = float(llm_timeout)
+        self.llm_cache_size = int(llm_cache_size)
         self._normalizer = TimestampNormalizer()
         self._schema_cache: Optional[Tuple[Tuple[Any, ...], InferenceSchema]] = None
         self._uid_cache: Optional[Tuple[Tuple[Any, ...], FrozenSet[str]]] = None
+        self._llm_cache: "OrderedDict[Tuple[str, str], InferredConstraints]" = OrderedDict()
 
     # ------------------------------------------------------------------ schema
     def schema(self) -> InferenceSchema:
@@ -229,6 +249,15 @@ class ConstraintInferrer:
                 relation=None,
                 space_names=space_names or None,
             )
+
+        if constraints is None and self.llm_client is not None and text.strip():
+            llm_result = self._infer_with_llm(text, schema, anchor)
+            if llm_result.constraints is not None:
+                llm_result.dropped = dropped + llm_result.dropped
+                llm_result.evidence = {**evidence, **llm_result.evidence}
+                return llm_result
+            dropped.extend(llm_result.dropped)
+
         confidence = min(scores) if scores else 0.0
         return InferredConstraints(
             constraints=constraints,
@@ -438,6 +467,222 @@ class ConstraintInferrer:
             scores.append(0.8)
         return found
 
+    # -------------------------------------------------------------------- llm
+    def _infer_with_llm(
+        self,
+        text: str,
+        schema: InferenceSchema,
+        anchor: Optional[float],
+    ) -> InferredConstraints:
+        key = (text, schema.version)
+        cached = self._llm_cache.get(key)
+        if cached is not None:
+            self._llm_cache.move_to_end(key)
+            return _copy_inference(cached)
+
+        raw, failure = self._call_llm(self._build_llm_prompt(text, schema, anchor))
+        if failure is not None:
+            return InferredConstraints(None, 0.0, "rule", [failure], {}, anchor)
+
+        dropped: List[str] = []
+        payload = _parse_llm_json(raw, dropped)
+        if payload is None:
+            return InferredConstraints(None, 0.0, "rule", dropped, {}, anchor)
+
+        constraints, evidence, confidence = self._validate_llm_payload(payload, schema, dropped)
+        applied = constraints is not None
+        result = InferredConstraints(
+            constraints=constraints,
+            confidence=confidence if applied else 0.0,
+            source="llm" if applied else "rule",
+            dropped=dropped,
+            evidence=evidence if applied else {},
+            reference_time=anchor,
+        )
+        self._remember_llm(key, result)
+        return _copy_inference(result)
+
+    def _remember_llm(self, key: Tuple[str, str], result: InferredConstraints) -> None:
+        if self.llm_cache_size <= 0:
+            return
+        self._llm_cache[key] = result
+        self._llm_cache.move_to_end(key)
+        while len(self._llm_cache) > self.llm_cache_size:
+            self._llm_cache.popitem(last=False)
+
+    def _call_llm(self, prompt: str) -> Tuple[Optional[str], Optional[str]]:
+        """Ask the client for one completion, bounded by ``llm_timeout``.
+
+        A daemon thread enforces the wall-clock bound because the OpenAI and
+        transformers clients expose no cancellation; an abandoned call dies with
+        the process instead of blocking retrieval.
+        """
+        client = self.llm_client
+        if client is None:
+            return None, "llm: unavailable"
+        outcome: Dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                if hasattr(client, "generate_answer"):
+                    outcome["reply"] = client.generate_answer(
+                        prompt, max_tokens=_LLM_MAX_TOKENS, temperature=0.0
+                    )
+                else:
+                    outcome["reply"] = client.generate(
+                        prompt, max_tokens=_LLM_MAX_TOKENS, temperature=0.0
+                    )
+            except Exception as exc:  # fail open: keep the unfiltered retrieval path
+                outcome["error"] = f"llm: {type(exc).__name__}: {exc}"
+
+        worker = threading.Thread(target=run, name="mandol-constraint-llm", daemon=True)
+        worker.start()
+        worker.join(self.llm_timeout)
+        if worker.is_alive():
+            return None, f"llm: timeout after {self.llm_timeout:g}s"
+        if "error" in outcome:
+            return None, str(outcome["error"])
+        reply = outcome.get("reply")
+        if not isinstance(reply, str) or not reply.strip():
+            return None, "llm: empty response"
+        return reply, None
+
+    def _build_llm_prompt(
+        self,
+        text: str,
+        schema: InferenceSchema,
+        anchor: Optional[float],
+    ) -> str:
+        field_lines: List[str] = []
+        for name, kind in schema.fields.items():
+            samples = [
+                repr(value)
+                for value in schema.values.get(name, ())[:_LLM_SAMPLE_VALUES]
+            ]
+            line = f"- {name}: {kind}; 可用操作符 {', '.join(sorted(_OPERATORS_BY_KIND[kind]))}"
+            if samples:
+                line += f"; 已观测值 {', '.join(samples)}"
+            field_lines.append(line)
+        mounted = sorted(str(name) for name in (getattr(self.semantic_map, "memory_spaces", {}) or {}))
+        anchor_text = _iso_utc(anchor) if anchor is not None else "未提供（不要输出相对时间）"
+        return (
+            "你是检索约束抽取器。只输出一个 JSON 对象，不要输出解释、Markdown 或代码块。\n"
+            f"查询：{text}\n"
+            "可用字段：\n"
+            + ("\n".join(field_lines) if field_lines else "- 无")
+            + "\n"
+            f"已挂载空间：{', '.join(mounted) if mounted else '无'}\n"
+            f"参考时间：{anchor_text}\n"
+            '输出格式：{"confidence": 0-1 的小数, '
+            '"metadata_filters": {"字段": {"操作符": 值}} 或 null, '
+            '"time_range": {"start": epoch 秒, "end": epoch 秒} 或 null, '
+            '"space_names": ["空间名"] 或 null}\n'
+            "只有当查询明确表达过滤条件时才输出谓词；没有约束时输出 {}。"
+        )
+
+    def _validate_llm_payload(
+        self,
+        payload: Dict[str, Any],
+        schema: InferenceSchema,
+        dropped: List[str],
+    ) -> Tuple[Optional[QueryConstraints], Dict[str, List[str]], float]:
+        """Keep only leaves the schema can answer, mirroring the rule guards."""
+        evidence: Dict[str, List[str]] = {}
+        metadata_filters: Dict[str, Dict[str, Any]] = {}
+
+        raw_filters = payload.get("metadata_filters")
+        if isinstance(raw_filters, dict):
+            for name, spec in raw_filters.items():
+                field = str(name)
+                predicate = _coerce_predicate(spec)
+                if predicate is None:
+                    dropped.append(f"llm: field '{field}': malformed predicate")
+                    continue
+                operator, value = predicate
+                if schema.kind(field) is None:
+                    dropped.append(f"llm: field '{field}' not in schema")
+                    continue
+                if operator in {"in", "nin"} and not isinstance(value, (list, tuple)):
+                    dropped.append(f"llm: field '{field}': operator '{operator}' needs a list")
+                    continue
+                if not schema.allows(field, operator):
+                    dropped.append(f"llm: field '{field}': operator '{operator}' not allowed")
+                    continue
+                if schema.kind(field) != "sorted" and not _values_observed(schema, field, operator, value):
+                    dropped.append(f"llm: field '{field}': value {value!r} not observed")
+                    continue
+                metadata_filters[field] = {operator: list(value) if isinstance(value, tuple) else value}
+                evidence.setdefault("attribute", []).append(f"llm:{field}:{operator}")
+        elif raw_filters is not None:
+            dropped.append("llm: metadata_filters must be an object or null")
+
+        time_range = self._validate_llm_time(payload.get("time_range"), schema, dropped)
+        if time_range is not None:
+            evidence["time"] = ["llm"]
+
+        spaces: List[str] = []
+        raw_spaces = payload.get("space_names")
+        mounted = getattr(self.semantic_map, "memory_spaces", {}) or {}
+        if isinstance(raw_spaces, list):
+            for name in raw_spaces:
+                if not isinstance(name, str) or not name.strip():
+                    dropped.append("llm: space: invalid name")
+                    continue
+                if name not in mounted:
+                    dropped.append(f"llm: space: {name}: not mounted")
+                    continue
+                if name not in spaces:
+                    spaces.append(name)
+            if spaces:
+                evidence["space"] = list(spaces)
+        elif raw_spaces is not None:
+            dropped.append("llm: space_names must be a list or null")
+
+        confidence = _LLM_DEFAULT_CONFIDENCE
+        raw_confidence = payload.get("confidence")
+        if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+            confidence = min(1.0, max(0.0, float(raw_confidence)))
+
+        constraints = None
+        if metadata_filters or time_range or spaces:
+            constraints = QueryConstraints(
+                metadata_filters=metadata_filters or None,
+                time_range=time_range,
+                relation=None,
+                space_names=spaces or None,
+            )
+        return constraints, evidence, confidence
+
+    def _validate_llm_time(
+        self,
+        raw_time: Any,
+        schema: InferenceSchema,
+        dropped: List[str],
+    ) -> Optional[TimeRange]:
+        if raw_time is None:
+            return None
+        if not isinstance(raw_time, dict):
+            dropped.append("llm: time_range must be an object or null")
+            return None
+        if schema.kind("timestamp") is None:
+            dropped.append("llm: time: timestamp field not observed")
+            return None
+
+        start = _coerce_epoch(raw_time.get("start"), self._normalizer)
+        end = _coerce_epoch(raw_time.get("end"), self._normalizer)
+        for name, bound in (("start", start), ("end", end)):
+            value = raw_time.get(name)
+            if value is not None and bound is None:
+                dropped.append(f"llm: time: unparsable {name} {value!r}")
+                return None
+        if start is None and end is None:
+            dropped.append("llm: time: empty range")
+            return None
+        if start is not None and end is not None and start > end:
+            dropped.append("llm: time: start after end")
+            return None
+        return TimeRange(start=start, end=end)
+
     # ----------------------------------------------------------------- anchors
     def _reference_epoch(self, value: Any) -> Optional[float]:
         if value is None:
@@ -449,6 +694,81 @@ class ConstraintInferrer:
 
 def _strip_quotes(value: str) -> str:
     return value.strip().strip("\"'“”‘’「」『』")
+
+
+def _copy_inference(result: InferredConstraints) -> InferredConstraints:
+    return InferredConstraints(
+        constraints=result.constraints,
+        confidence=result.confidence,
+        source=result.source,
+        dropped=list(result.dropped),
+        evidence={key: list(values) for key, values in result.evidence.items()},
+        reference_time=result.reference_time,
+    )
+
+
+def _parse_llm_json(reply: str, dropped: List[str]) -> Optional[Dict[str, Any]]:
+    body = str(reply or "").strip()
+    if body.startswith("```"):
+        body = body.strip("`").strip()
+        if body[:4].lower() == "json":
+            body = body[4:].strip()
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        dropped.append("llm: invalid JSON response")
+        return None
+    try:
+        payload = json.loads(body[start : end + 1])
+    except (TypeError, ValueError):
+        dropped.append("llm: invalid JSON response")
+        return None
+    if not isinstance(payload, dict):
+        dropped.append("llm: invalid JSON response")
+        return None
+    return payload
+
+
+def _coerce_predicate(spec: Any) -> Optional[Tuple[str, Any]]:
+    if isinstance(spec, dict):
+        if len(spec) != 1:
+            return None
+        operator, value = next(iter(spec.items()))
+        operator = str(operator).strip().lower()
+        if not operator or value is None:
+            return None
+        return operator, value
+    if spec is None:
+        return None
+    return "eq", spec
+
+
+def _values_observed(
+    schema: InferenceSchema,
+    name: str,
+    operator: str,
+    value: Any,
+) -> bool:
+    if operator in {"eq", "ne"}:
+        return schema.has_value(name, value)
+    if operator in {"in", "nin"}:
+        if not isinstance(value, (list, tuple)) or not value:
+            return False
+        return all(schema.has_value(name, item) for item in value)
+    return True
+
+
+def _coerce_epoch(value: Any, normalizer: TimestampNormalizer) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) > 0 else None
+    return normalizer.normalize(value)
+
+
+def _iso_utc(epoch: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
 
 
 def _day_start(epoch: float) -> float:
